@@ -1,0 +1,749 @@
+############### Kickstarter projects
+
+############## Packages
+library(tidyverse)
+library(lubridate)
+library(tidytext)
+library(randomForest)
+library(caret)
+library(gbm)
+library(wordcloud2)
+library(RColorBrewer)
+library(tm)
+library(ROSE)
+library(data.table)
+library(ROCR)
+library(gridExtra)
+library(grid)
+library(ROCR)
+library(xgboost)
+
+############# Data and cleaning
+filepath <- "D:/Users/Gregor/Desktop/Kaggle/Kickstarter projects/ks-projects-201801.csv"
+
+kickstarter_data <- read_csv(filepath, col_names = T, cols(state = col_factor(), currency = col_factor(),
+                                                           category = col_factor(), main_category = col_factor(),
+                                                           country = col_factor()))
+
+
+glimpse(kickstarter_data)
+summary(kickstarter_data)
+head(kickstarter_data)
+
+kickstarter_clean <- kickstarter_data %>%
+  filter(state %in% c("failed", "canceled", "successful", "suspended")) %>%
+  mutate(state_bi = ifelse(state == "successful", 1, 0)) %>%
+  mutate(launch_year = year(launched))
+
+count(kickstarter_clean, state)
+count(kickstarter_clean, state_bi)
+
+glimpse(kickstarter_clean)
+table(year(kickstarter_data$launched))
+
+kickstarter_clean <- kickstarter_clean %>%
+  select(- c(pledged, state, `usd pledged`, goal)) %>%
+  filter(!(launch_year %in% c(2009, 2018))) %>%
+  group_by(main_category) %>%
+  mutate(bi_cat = mean(state_bi)) %>%
+  ungroup()
+
+glimpse(kickstarter_clean)
+
+
+kickstarter_data[kickstarter_data$usd_goal_real > 1000000 & kickstarter_data$state == "successful", ]$name #vidimo, da je samo 11 projektov uspesno izvedlo pridobivanje vec kot 1.000.000 USD sredstev, kar predstavlja 0.9% vseh nad 1000000
+
+
+#------------------------------------------------------------------------------------------------
+
+###################################### EXPLORATORY DATA ANALYSIS
+  
+
+#Katere kategorije imajo večji delež uspešnih projektov
+
+sapply(kickstarter_clean, function(x) sum(is.na(x))) #Pogledamo, ce kje in koliko je NA-jev
+
+kickstarter_clean %>%
+  group_by(main_category) %>%
+  summarise(success_per = mean(state_bi)) %>%
+  arrange(desc(success_per)) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(main_category, - success_per), y = success_per)) +
+    geom_col() +
+    theme(axis.text.x = element_text(angle = 45))
+  
+#Katere kategorije imajo največji delež uspešnih projektov pobarvano s številom backerjev
+
+kickstarter_clean %>%
+  group_by(main_category) %>%
+  summarise(success_per = mean(state_bi), n_backers = sum(backers)) %>%
+  arrange(desc(success_per)) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(main_category, - success_per), y = success_per, fill = n_backers)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45))
+
+
+#V katere kategorije se je steklo največ denarja?
+
+kickstarter_clean %>%
+  group_by(main_category) %>%
+  summarise(total_pledged = sum(usd_pledged_real)) %>%
+  arrange(desc(total_pledged)) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(main_category, - total_pledged), y = total_pledged)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45))
+
+
+#Katere kategorije so bolj pogoste? (Število projektov)
+
+kickstarter_clean %>%
+  group_by(main_category) %>%
+  summarise(n_proj = n()) %>%
+  ggplot(aes(x = reorder(main_category, -n_proj), y = n_proj)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45))
+
+
+
+#Kako so kategorije homogene? Glede na zahtevan znesek
+
+kickstarter_clean %>%
+  ggplot(aes(x = main_category, y = usd_goal_real, fill = bi_cat)) +
+    geom_boxplot() +
+    coord_cartesian(ylim = c(0, 100000)) +
+    theme(axis.text.x = element_text(angle = 45))
+
+
+#Kako so kategorije homogene glede na vložen denar
+
+kickstarter_clean %>%
+  ggplot(aes(x = main_category, y = usd_pledged_real, fill = bi_cat)) +
+  geom_violin() +
+  coord_cartesian(ylim = c(0, 75000)) +
+  theme(axis.text.x = element_text(angle = 45))
+
+
+#Število projektov po letih
+
+kickstarter_clean %>%
+  group_by(launch_year) %>%
+  summarise(st_proj = n()) %>%
+  ggplot(aes(x = launch_year, y = st_proj)) +
+    geom_bar(stat = "identity") +
+    scale_x_continuous(breaks = seq(2009, 2017, 1))
+
+
+#Uspešen % fundinga po letih
+
+kickstarter_clean %>%
+  group_by(launch_year) %>%
+  summarise(succ_rate = mean(state_bi)) %>%
+  ungroup() %>%
+  ggplot(aes(x = launch_year, y = succ_rate)) +
+  geom_bar(stat = "identity") +
+  scale_x_continuous(breaks = seq(2009, 2017, 1))
+
+#Količina investiranega $ po letih
+
+kickstarter_clean %>%
+  group_by(launch_year) %>%
+  summarise(inv = sum(usd_pledged_real)) %>%
+  ungroup() %>%
+  ggplot(aes(x = launch_year, y = inv)) +
+  geom_bar(stat = "identity") +
+  scale_x_continuous(breaks = seq(2009, 2017, 1))
+
+
+
+#################################### SENTIMENT ANALYSIS - AFINN in BING
+
+
+#Analiza sentimenta - ali so projekti s pozitivnim sentimentom bolj uspešni % - BINARY BING LEXICON
+
+kickstarter_bing <- kickstarter_clean %>%
+  unnest_tokens(word, name) %>%
+  inner_join(get_sentiments("bing"), by = "word")
+
+kickstarter_bing <- kickstarter_bing %>% 
+  count(ID, sentiment) %>%
+  spread(sentiment, n) %>%
+  replace_na(list(negative = 0, positive = 0)) %>%
+  mutate(ovrl_sen = positive - negative) %>%
+  select(ID, ovrl_sen)
+
+
+clean_bing <- inner_join(kickstarter_clean, kickstarter_bing, by = "ID")
+
+clean_bing %>%
+  filter(ovrl_sen > -5 & ovrl_sen < 5) %>%
+  group_by(ovrl_sen) %>%
+  summarise(per = mean(state_bi), cash = sum(usd_pledged_real / n()), nproj = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = ovrl_sen, y = per, fill = cash)) +
+    geom_col(position = "dodge2") +
+    geom_text(aes(label = nproj, vjust = - 1))
+
+clean_bing %>%
+  count(ovrl_sen)
+
+
+
+#Analiza sentimenta - ali so projekti s pozitivnim sentimentom bolj uspešni % - AFINN LEXICON
+
+kickstarter_afinn <- kickstarter_clean %>%
+  unnest_tokens(word, name) %>%
+  inner_join(get_sentiments("afinn"), by = "word")
+
+
+#Izracun koncne sentiment vrednosti za vsak naslov
+kickstarter_afinn <- kickstarter_afinn %>% 
+  group_by(ID) %>%
+  mutate(totsen = sum(value)) %>%
+  select(ID, totsen)
+
+count(kickstarter_afinn, ID) %>% arrange(desc(n)) #Da vidimo, kateri ID ima najvec primerov
+filter(kickstarter_afinn, ID == 552538914)
+
+unikati <- unique(kickstarter_afinn) #Pocisceni duplikati
+
+clean_afinn <- inner_join(kickstarter_clean, unikati, by = "ID") #Zdruziti sentiment vrednosti z originalnim df z ostalimi podatki
+
+count(clean_afinn, totsen)
+
+#Tabela z ekstremnimi sentiment value-i
+najbolj_negativni_bing <- clean_bing %>%
+  filter(ovrl_sen <= -4)
+
+najbolj_pozitivni_bing <- clean_bing %>%
+  filter(ovrl_sen >= 4)
+
+najbolj_negativni_afinn <- clean_afinn %>%
+  filter(totsen < -8)
+
+najbolj_pozitivni_afinn <- clean_afinn %>%
+  filter(totsen > 11)
+
+##################----- Kratke predstavitve rezultatov dobljenih s sentiment analysis
+#Wordcloudi
+
+
+tekst <- kickstarter_data$name
+kickstarter_corpus <- Corpus(VectorSource(tekst[sample(length(tekst), 1000)])) #Naredimo corpus sample velikosti 1000
+
+clean_corpus <- kickstarter_corpus %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(stripWhitespace)
+
+clean_corpus <- tm_map(clean_corpus, content_transformer(tolower))
+clean_corpus <- tm_map(clean_corpus, removeWords, c(stopwords("english"), "canceled", "film", "book", "project", "game", "new", "album", "music")) #scistimo tekst
+
+dtm <- TermDocumentMatrix(clean_corpus)
+dtm_matrix <- as.matrix(dtm)
+words <- sort(rowSums(dtm_matrix), decreasing = T)
+wordcloud_data <- data.frame(word = names(words), freq = words)
+
+wordcloud2(data = wordcloud_data, color = "random-dark")
+#Vidimo, da je vecina stvari okoli love, smart, good, free, modern, fun, help, good, creative,...
+
+
+
+
+#######################-------- Analiza podatkov pridobljenih s sentimentalno obdelavo
+
+
+# Malo pobrisemo nepotrebne zadeve
+rm(najbolj_negativni_afinn,najbolj_negativni_bing,najbolj_pozitivni_afinn,najbolj_pozitivni_bing)
+rm(tekst, words)
+rm(dtm, dtm_matrix)
+rm(unikati, wordcloud_data, clean_corpus, kickstarter_corpus)
+rm(kickstarter_afinn, kickstarter_bing)
+rm(clean_bing)
+
+
+#Prikaz distribucije, kaksna je uspesnost fundinga glede na overal sentiment projekta
+clean_afinn %>%
+  group_by(totsen) %>%
+  summarise(per = mean(state_bi), cash = sum(usd_pledged_real / n()), nproj = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = totsen, y = per, fill = cash)) +
+  geom_col(position = "dodge2", width = 1) +
+  geom_text(aes(label = nproj, vjust = - 1))
+
+
+
+#############################################################################
+
+
+
+#Vpliva dolžina projekta na njegovo uspešnost?
+
+
+kickstarter_clean <- kickstarter_clean %>%
+  mutate(launched = as_date(launched)) %>%
+  mutate(duration = as.numeric(deadline - launched))
+
+kickstaret_clean_sample <- sample_n(kickstarter_clean, 1000)
+
+
+ggplot(kickstaret_clean_sample, aes(x = state_bi, y = duration, group = state_bi)) +
+  geom_boxplot(alpha = 0.3) +
+  geom_jitter(alpha = 0.8, color = "peachpuff4") #Tam duration okoli 60 izgleda, da niso prevec uspesni
+
+duration_model <- lm(state_bi ~ duration, data = kickstarter_clean)
+summary(duration_model) ############# Tu je potrebno preveriti, ce je treba/lahko pretvoriti nazaj iz log oddsov v verjetnost zmanjsanja
+
+sentiment_model <- lm(state_bi ~ totsen, data = clean_afinn)
+summary(sentiment_model)
+
+
+
+
+#Model uspešnosti fundinga - random forrest
+
+rm(clean_bing, duration_model, kickstaret_clean_sample, kickstarter_bing, sentiment_model) #Malo je pocistimo pred modeliranjem
+
+############!!!! POTREBNO JE BALANSIRATI SET? Lahko z classwt parametrom, tudi stratified sampling
+clean_afinn$launched <- as.Date(clean_afinn$launched)
+
+
+clean_model_data <- inner_join(clean_afinn, kickstarter_clean, by = c("ID", "name", "category", "main_category", "currency", "deadline", "launched", "backers", "country", "usd_pledged_real", "usd_goal_real", "state_bi", "launch_year", "bi_cat"))
+
+
+clean_model_data <- clean_model_data %>%
+  select(-c(ID, name, currency, deadline, launched, category, country, usd_pledged_real, backers, bi_cat)) %>%
+  mutate(state_bi = as.factor(state_bi))
+
+
+split_rows <- sample(nrow(clean_model_data), nrow(clean_model_data) / 2) #Splitaš na pol na training in test split
+train_data <- clean_model_data[split_rows, ]
+test_data <- clean_model_data[-split_rows, ]
+
+#Malo se pocistimo sproti
+rm(clean_afinn, modeldat_afinn)
+
+
+nrow(clean_model_data["state_bi"] == 0) #vseh observationov je 102466
+sum(clean_model_data["state_bi"] == 0) #neuspesnih je 66461
+sum(clean_model_data["state_bi"] == 1) #uspesnih je 36005
+36005/102466 #baseline je, da uspe 35,1% vseh projektov
+
+
+
+################ DO TUKAJ JE UREJENO
+over_rf <- ovun.sample(state_bi ~ ., data = train_data, method = "over") #Z oversamplingom  balansiramo dataset
+table(over_rf$data$state_bi) #Dobimo balansirana class-a
+over_data <- over_rf$data
+
+
+set.seed(2020)
+kick_rf_model <- randomForest(state_bi ~ ., data = train_data) 
+print(kick_rf_model) #Dober model, 0,74% oob error rate
+plot(kick_rf_model)
+importance(kick_rf_model)
+
+
+kick_rf_probs <- predict(kick_rf_model, newdata = test_data, type = "response")
+cmat <- confusionMatrix(data = kick_rf_probs, reference = test_data$state_bi)
+print(cmat)
+cmat$overall[[1]]
+
+
+
+kick_rf_model_over <- randomForest(state_bi ~ ., data = over_data) #Naredimo model in analizo se na balanced datasetu
+print(kick_rf_model_over)
+plot(kick_rf_model_over)
+importance(kick_rf_model_over)
+
+kick_rf_probs_over <- predict(kick_rf_model_over, newdata = test_data, type = "response")
+cmat_over <- confusionMatrix(data = kick_rf_probs_over, reference = test_data$state_bi)
+print(cmat_over) #Vidimo, da balanced dataset da precej boljsi specificity kot ga je dal model treniran na unbalanced datasetu (0.495 proti 0.373) ob le malem zmanjsanju accuracy-ja
+cmat_over$overall[[1]]
+
+
+
+#Probamo ROCR za predictione
+klasicni_prediction <- prediction(kick_rf_model$votes[, 2], train_data$state_bi)
+auc_temp_klasik <- performance(klasicni_prediction, "auc")
+klasik_auc <- as.numeric(auc_temp_klasik@y.values)
+klasik_auc #Dobimo 0.67 AUC, precej bogo (glede na default)
+klasik_plot_perf <- performance(klasicni_prediction, "tpr", "fpr")
+plot(klasik_plot_perf, colorize = T)
+
+
+balanced_prediction <- prediction(kick_rf_model_over$votes[, 2], over_data$state_bi)
+auc_temp_balans <- performance(balanced_prediction, "auc")
+balans_auc <- as.numeric(auc_temp_balans@y.values)
+balans_auc #Dobimo AUC po balansiranem datasetu 0.87, bistveno izboljsanje
+balans_plot_perf <- performance(balanced_prediction, "tpr", "fpr")
+plot(balans_plot_perf, colorize = T)
+
+##### Model uspešnosti fundinga - GBM model
+over_data_gbm <- over_data
+over_data_gbm$state_bi <- as.numeric(over_data_gbm$state_bi) - 1
+
+#kick_gbm <- gbm(state_bi ~ ., data = over_data_gbm, distribution = "bernoulli", n.trees = 10000, cv.folds = 5, shrinkage = 0.001) #Naredimo random forrest z boostingom
+#summary(kick_gbm)
+#gbm_predict <- predict(kick_gbm, newdata = test_data, type = "response", n.trees = 10000)
+#gbm_preds <- ifelse(gbm_predict > 0.5, 1, 0)
+#table(gbm_preds)
+#mean(gbm_preds == test_data$state_bi) #Tudi dobimo 0.637% accuracy, ki pa ni dober nacin merjenja kakovosti modela
+
+#### Poizkus xgboostinga
+dummy <- dummyVars(" ~ .", train_data)
+xgtrain <- data.frame(predict(dummy, newdata = train_data))
+xgtrain <- as.matrix(xgtrain)
+xgtrain_name <- as.numeric(train_data$state_bi) - 1
+
+dummy2 <- dummyVars(" ~ .", data = test_data)
+xgtest <- data.frame(predict(dummy2, newdata = test_data))
+xgtest <- as.matrix(xgtest)
+xgtest_name <- as.numeric(test_data$state_bi) - 1
+
+
+xgb.fit1 <- xgb.cv(
+  data = xgtrain,
+  label = xgtrain_name,
+  nrounds = 1000,
+  nfold = 5,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+xgb.fit1$evaluation_log %>%
+  summarise(
+    ntrees.train = which(train_logloss_mean == min(train_logloss_mean))[1],
+    logloss.train   = min(train_logloss_mean),
+    ntrees.test  = which(test_logloss_mean == min(test_logloss_mean))[1],
+    rmse.test   = min(test_logloss_mean),
+  )
+
+ggplot(xgb.fit1$evaluation_log) +
+  geom_line(aes(iter, train_logloss_mean), color = "red") +
+  geom_line(aes(iter, test_logloss_mean), color = "blue")
+
+
+#xgboost glede na blog na kagglu https://www.kaggle.com/rtatman/machine-learning-with-xgboost-in-r
+
+clean_model_data_shuff <- clean_model_data[sample(1:nrow(clean_model_data)), ] #premesamo vrstni red
+
+xgtrain_comp <- clean_model_data_shuff %>%
+  select(-c(state_bi, main_category)) #Odstranimo vse non-numeric variable
+
+head(clean_model_data_shuff$main_category) #Vidimo, da ni numeric valda
+
+xgtrain_comp_lab <- clean_model_data_shuff$state_bi #shranimo labele loceno, da ne vplivajo na trening modela
+
+categories <- model.matrix(~main_category-1, clean_model_data_shuff) #pretvorimo kategoricne informacije v numericni format (one-hot encoding)
+
+xgtrain_comp_num <- cbind(xgtrain_comp, categories) #Zdruzimo oba dataseta v dataframe
+xgtrain_comp_mat <- data.matrix(xgtrain_comp_num) #Pretvorimo ta dataframe v matrix
+
+xgsplit <- round(length(xgtrain_comp_lab) * 0.7) #Pripravis za 70/30 split
+xg_train_dat <- xgtrain_comp_mat[1:xgsplit, ]
+xg_train_lab <- xgtrain_comp_lab[1:xgsplit]
+
+xg_test_dat <- xgtrain_comp_mat[-(1:xgsplit), ]
+xg_test_lab <- xgtrain_comp_lab[-(1:xgsplit)]
+
+xgtrain <- xgb.DMatrix(data = xg_train_dat, label = as.numeric(as.character(xg_train_lab)))
+xgtest <- xgb.DMatrix(data = xg_test_dat, label = as.numeric(as.character(xg_test_lab))) #Naredis xgb.DMatrix file formata, ki sta bolj optimizirana za training
+
+xg1 <- xgboost(xgtrain,
+               nround = 10000,
+               objective = "binary:logistic",
+               early_stopping_rounds = 20)
+
+xg1preds <- predict(xg1, xgtest)
+xg1err <- mean(as.numeric(xg1preds > 0.5) != xg_test_lab)
+xg2err <- mean(as.numeric(xg1preds > 0.5) != as.numeric(as.character(xg_test_lab)))
+print(xg1err)
+print(xg2err)
+
+xgb.set.config(use_rmm = T)
+
+xg1_tuned <- xgboost(xgtrain,
+                     max.depth = 3,
+                     nround = 10000,
+                     objective = "binary:logistic")
+print(xg1_tuned)
+xg1_tuned_preds <- predict(xg1_tuned, xgtest)
+xg1_tuned_err <- mean(as.numeric(xg1_tuned_preds > 0.5) != xg_test_lab)
+print(xg1_tuned_err) #Dobro, da je manjsi error na testing data, kot na training - ni overfittanja
+table(predictions = xg1_tuned_preds>0.5, reality = xg_test_lab)
+
+negative_cases <- sum(xg_train_lab == 0)
+positive_cases <- sum(xg_train_lab == 1)
+
+xg_bal_model <- xgboost(xgtrain,
+                        max.depth = 3,
+                        nround = 1000,
+                        early_stopping_rounds = 5,
+                        objective = "binary:logistic",
+                        scale_pos_weight = negative_cases/positive_cases)
+print(xg_bal_model)
+xg_bal_preds <- predict(xg_bal_model, xgtest)
+xg_bal_err <- mean(as.numeric(xg_bal_preds > 0.5) != xg_test_lab)
+print(xg_bal_err) #Dobro, da je manjsi error na testing data, kot na training - ni overfittanja
+table(predictions = xg_bal_preds>0.5, reality = xg_test_lab)
+
+xg_bal_model_gam <- xgboost(xgtrain,
+                        max.depth = 3,
+                        nround = 1000,
+                        early_stopping_rounds = 5,
+                        objective = "binary:logistic",
+                        scale_pos_weight = negative_cases/positive_cases,
+                        gamma = 1)
+print(xg_bal_model_gam)
+xg_bal_gam_preds <- predict(xg_bal_model_gam, xgtest)
+xg_bal_gam_err <- mean(as.numeric(xg_bal_gam_preds > 0.5) != xg_test_lab)
+print(xg_bal_gam_err) #Dobro, da je manjsi error na testing data, kot na training - ni overfittanja
+table(predictions = xg_bal_gam_preds>0.5, reality = xg_test_lab)
+
+xgb.plot.multi.trees(feature_names = names(xgtrain_comp_mat), model = xg_bal_model_gam)
+auc(xg_bal_model_gam)
+
+
+
+
+
+
+
+#Model uspešnosti fundinga - logistic model
+
+
+logi_mod <- glm(state_bi ~ ., data = train_data, family = binomial)
+summary(logi_mod)
+logi_summary <- summary(logi_mod)
+
+
+logipreds <- predict(logi_mod, newdata = test_data, type = "response")
+logipreds2 <- ifelse(logipreds > 0.5, 1, 0)
+
+table(predictions = logipreds2, truth = test_data$state_bi)
+mean(logipreds2 == test_data$state_bi)
+
+#-------------------------------
+
+logi_mod_bal <- glm(state_bi ~ ., data = over_data, family = binomial)
+summary(logi_mod_bal)
+logi_bal_summary <- summary(logi_mod_bal)
+
+logi_bal_preds <- predict(logi_mod_bal, newdata = test_data, type = "response")
+logi_bal_preds2 <- ifelse(logi_bal_preds > 0.5, 1, 0)
+
+table(predictions = logi_bal_preds2, truth = test_data$state_bi)
+mean(logi_bal_preds2 == test_data$state_bi)
+
+########### Od onega iz bloga
+
+list(logi_summary$coefficient, 
+      round( 1 - (logi_summary$deviance / logi_summary$null.deviance ), 2 ) ) #Model razlozi cca 6% variance
+
+train_data_bl <- train_data 
+test_data_bl <- test_data
+
+train_data_bl$prediction <- predict(logi_mod, newdata = train_data_bl, type = "response")
+test_data_bl$prediction <- predict(logi_mod, newdata = test_data_bl, type = "response")
+
+train_data_bl_ind <- sample(nrow(train_data_bl), size = 2000)
+train_data_bl_sam <- train_data_bl[train_data_bl_ind, ]
+
+test_data_bl_ind <- sample(nrow(test_data_bl), 2000)
+test_data_bl_sam <- test_data_bl[test_data_bl_ind, ]
+
+
+ggplot(train_data_bl, aes(prediction, color = as.factor(state_bi) ) ) + 
+  geom_density( size = 1 ) +
+  ggtitle("Training Set's Predicted Score") + 
+  theme_bw()
+
+AccuracyCutoffInfo <- function( train, test, predict, actual )
+{
+  # change the cutoff value's range as you please 
+  cutoff <- seq( .2, .6, by = .05 )
+  
+  accuracy <- lapply( cutoff, function(c)
+  {
+    # use the confusionMatrix from the caret package
+    cm_train <- confusionMatrix(as.factor(as.numeric( train[[predict]] > c )), train[[actual]] )
+    cm_test  <- confusionMatrix(as.factor(as.numeric( test[[predict]]  > c )), test[[actual]]  )
+    
+    dt <- data.table( cutoff = c,
+                      train  = cm_train$overall[["Accuracy"]],
+                      test   = cm_test$overall[["Accuracy"]] )
+    return(dt)
+  }) %>% rbindlist()
+  
+  # visualize the accuracy of the train and test set for different cutoff value 
+  # accuracy in percentage.
+  accuracy_long <- gather( accuracy, "data", "accuracy", -1 )
+  
+  plot <- ggplot( accuracy_long, aes( cutoff, accuracy, group = data, color = data ) ) + 
+    geom_line( size = 1 ) + geom_point( size = 3 ) +
+    scale_y_continuous( label = scales::percent ) +
+    ggtitle( "Train/Test Accuracy for Different Cutoff" )
+  
+  return( list( data = accuracy, plot = plot ) )
+}
+
+accuracy_info <- AccuracyCutoffInfo(train = train_data_bl, test = test_data_bl,
+                                    predict = "prediction", actual = "state_bi")
+
+accuracy_info$plot
+
+
+ConfusionMatrixInfo <- function( data, predict, actual, cutoff )
+{	
+  # extract the column ;
+  # relevel making 1 appears on the more commonly seen position in 
+  # a two by two confusion matrix	
+  predict <- data[[predict]]
+  actual  <- relevel( as.factor( data[[actual]] ), "1" )
+  
+  result <- data.table( actual = actual, predict = predict )
+  
+  # caculating each pred falls into which category for the confusion matrix
+  result[ , type := ifelse( predict >= cutoff & actual == 1, "TP",
+                            ifelse( predict >= cutoff & actual == 0, "FP", 
+                                    ifelse( predict <  cutoff & actual == 1, "FN", "TN" ) ) ) %>% as.factor() ]
+  
+  # jittering : can spread the points along the x axis 
+  plot <- ggplot( result, aes( actual, predict, color = type ) ) + 
+    geom_violin( fill = "white", color = NA ) +
+    geom_jitter( shape = 1 ) + 
+    geom_hline( yintercept = cutoff, color = "blue", alpha = 0.6 ) + 
+    scale_y_continuous( limits = c( 0, 1 ) ) + 
+    scale_color_discrete( breaks = c( "TP", "FN", "FP", "TN" ) ) + # ordering of the legend 
+    guides( col = guide_legend( nrow = 2 ) ) + # adjust the legend to have two rows  
+    ggtitle( sprintf( "Confusion Matrix with Cutoff at %.2f", cutoff ) )
+  
+  return( list( data = result, plot = plot ) )
+}
+
+cm_info <- ConfusionMatrixInfo(data = test_data_bl_sam, predict = "prediction",
+                               actual = "state_bi", cutoff = 0.2)
+
+cm_info$plot
+
+cost_fp <- 300
+cost_fn <- 100
+
+
+ROCInfo <- function( data, predict, actual, cost.fp, cost.fn )
+{
+  # calculate the values using the ROCR library
+  # true positive, false postive 
+  pred <- prediction( data[[predict]], data[[actual]] )
+  perf <- performance( pred, "tpr", "fpr" )
+  roc_dt <- data.frame( fpr = perf@x.values[[1]], tpr = perf@y.values[[1]] )
+  
+  # cost with the specified false positive and false negative cost 
+  # false postive rate * number of negative instances * false positive cost + 
+  # false negative rate * number of positive instances * false negative cost
+  cost <- perf@x.values[[1]] * cost.fp * sum( data[[actual]] == 0 ) + 
+    ( 1 - perf@y.values[[1]] ) * cost.fn * sum( data[[actual]] == 1 )
+  
+  cost_dt <- data.frame( cutoff = pred@cutoffs[[1]], cost = cost )
+  
+  # optimal cutoff value, and the corresponding true positive and false positive rate
+  best_index  <- which.min(cost)
+  best_cost   <- cost_dt[ best_index, "cost" ]
+  best_tpr    <- roc_dt[ best_index, "tpr" ]
+  best_fpr    <- roc_dt[ best_index, "fpr" ]
+  best_cutoff <- pred@cutoffs[[1]][ best_index ]
+  
+  # area under the curve
+  auc <- performance( pred, "auc" )@y.values[[1]]
+  
+  # normalize the cost to assign colors to 1
+  normalize <- function(v) ( v - min(v) ) / diff( range(v) )
+  
+  # create color from a palette to assign to the 100 generated threshold between 0 ~ 1
+  # then normalize each cost and assign colors to it, the higher the blacker
+  # don't times it by 100, there will be 0 in the vector
+  col_ramp <- colorRampPalette( c( "green", "orange", "red", "black" ) )(100)   
+  col_by_cost <- col_ramp[ ceiling( normalize(cost) * 99 ) + 1 ]
+  
+  roc_plot <- ggplot( roc_dt, aes( fpr, tpr ) ) + 
+    geom_line( color = rgb( 0, 0, 1, alpha = 0.3 ) ) +
+    geom_point( color = col_by_cost, size = 4, alpha = 0.2 ) + 
+    geom_segment( aes( x = 0, y = 0, xend = 1, yend = 1 ), alpha = 0.8, color = "royalblue" ) + 
+    labs( title = "ROC", x = "False Postive Rate", y = "True Positive Rate" ) +
+    geom_hline( yintercept = best_tpr, alpha = 0.8, linetype = "dashed", color = "steelblue4" ) +
+    geom_vline( xintercept = best_fpr, alpha = 0.8, linetype = "dashed", color = "steelblue4" )				
+  
+  cost_plot <- ggplot( cost_dt, aes( cutoff, cost ) ) +
+    geom_line( color = "blue", alpha = 0.5 ) +
+    geom_point( color = col_by_cost, size = 4, alpha = 0.5 ) +
+    ggtitle( "Cost" ) +
+    scale_y_continuous( labels = formattable::comma ) +
+    geom_vline( xintercept = best_cutoff, alpha = 0.8, linetype = "dashed", color = "steelblue4" )	
+  
+  # the main title for the two arranged plot
+  sub_title <- sprintf( "Cutoff at %.2f - Total Cost = %f, AUC = %.3f", 
+                        best_cutoff, best_cost, auc )
+  
+  # arranged into a side by side plot
+  plot <- arrangeGrob( roc_plot, cost_plot, ncol = 2, 
+                       top = textGrob( sub_title, gp = gpar( fontsize = 16, fontface = "bold" ) ) )
+  
+  return( list( plot 		  = plot, 
+                cutoff 	  = best_cutoff, 
+                totalcost   = best_cost, 
+                auc         = auc,
+                sensitivity = best_tpr, 
+                specificity = 1 - best_fpr ) )
+}
+
+roc_info <- ROCInfo(data = cm_info$data, predict = "predict", actual = "actual",
+                    cost.fp = cost_fp, cost.fn = cost_fn)
+
+
+grid.draw(roc_info$plot)
+
+
+
+#Se od onega iz bloga z balanced datasetom
+list(logi_bal_summary$coefficient, 
+     round( 1 - (logi_bal_summary$deviance / logi_bal_summary$null.deviance ), 2 ) ) #Model razlozi cca 6% variance
+
+train_data_bl_bal <- over_data
+test_data_bl_bal <- test_data
+
+train_data_bl_bal$prediction <- predict(logi_mod_bal, newdata = over_data, type = "response")
+test_data_bl_bal$prediction <- predict(logi_mod_bal, newdata = test_data_bl_bal, type = "response")
+
+train_data_bl_bal_ind <- sample(nrow(train_data_bl_bal), size = 2000)
+train_data_bl_bal_sam <- train_data_bl_bal[train_data_bl_bal_ind, ]
+
+test_data_bl_bal_ind <- sample(nrow(test_data_bl_bal), 2000)
+test_data_bl_bal_sam <- test_data_bl_bal[test_data_bl_bal_ind, ]
+
+
+ggplot(train_data_bl_bal, aes(prediction, color = as.factor(state_bi) ) ) + 
+  geom_density( size = 1 ) +
+  ggtitle("Training Set's Predicted Score on the Balanced dataset") + 
+  theme_bw()
+
+accuracy_info_bal <- AccuracyCutoffInfo(train = train_data_bl_bal, test = test_data_bl_bal,
+                                    predict = "prediction", actual = "state_bi")
+
+accuracy_info_bal$plot
+
+cm_info_bal <- ConfusionMatrixInfo(data = test_data_bl_bal_sam, predict = "prediction",
+                               actual = "state_bi", cutoff = 0.2)
+
+cm_info_bal$plot
+
+cost_fp <- 100
+cost_fn <- 100
+
+
+roc_info_bal <- ROCInfo(data = cm_info_bal$data, predict = "predict", actual = "actual",
+                    cost.fp = cost_fp, cost.fn = cost_fn)
+
+
+grid.draw(roc_info_bal$plot)
